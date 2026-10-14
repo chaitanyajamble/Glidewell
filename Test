@@ -1,0 +1,769 @@
+
+testpaths = tests
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+addopts = -ra -v
+filterwarnings =
+    ignore::DeprecationWarning
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.database import Base, get_db
+from app.dependencies import get_current_user
+from app.main import app
+from app.models import User, UserRole
+from app.security import create_access_token, hash_password
+
+
+@pytest.fixture(scope="session")
+def test_engine(tmp_path_factory):
+    """
+    Creates one isolated SQLite database for the entire test session.
+    """
+    db_path = tmp_path_factory.mktemp("db") / "test_glidewell.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def db_session(test_engine):
+    """
+    Provides a database session and cleans created rows after each test.
+    """
+    TestingSession = sessionmaker(
+        bind=test_engine,
+        autocommit=False,
+        autoflush=False,
+    )
+    session = TestingSession()
+    try:
+        yield session
+    finally:
+        session.rollback()
+        session.close()
+
+
+@pytest.fixture
+def client(test_engine, tmp_path, monkeypatch):
+    """
+    Provides a FastAPI TestClient using the isolated test database and uploads folder.
+    """
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr("app.config.get_settings.UPLOAD_DIR", str(upload_dir))
+    monkeypatch.setattr("app.routers.cases.settings.UPLOAD_DIR", str(upload_dir))
+
+    TestingSession = sessionmaker(
+        bind=test_engine,
+        autocommit=False,
+        autoflush=False,
+    )
+
+    def override_get_db():
+        session = TestingSession()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    with TestClient(app) as test_client:
+        yield test_client
+
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def admin_user(db_session):
+    user = User(
+        email=f"admin-{uuid.uuid4().hex[:8]}@example.com",
+        full_name="Test Admin",
+        hashed_password=hash_password("Admin@12345"),
+        role=UserRole.ADMIN,
+        practice_name="Test Admin Practice",
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    return user
+
+
+@pytest.fixture
+def dentist_user(db_session):
+    user = User(
+        email=f"dentist-{uuid.uuid4().hex[:8]}@example.com",
+        full_name="Test Dentist",
+        hashed_password=hash_password("Dentist@12345"),
+        role=UserRole.DENTIST,
+        practice_name="Test Dental Practice",
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    return user
+
+
+@pytest.fixture
+def admin_headers(admin_user):
+    token = create_access_token(admin_user.email, admin_user.role.value)
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def dentist_headers(dentist_user):
+    token = create_access_token(dentist_user.email, dentist_user.role.value)
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def seeded_product(db_session):
+    from app.models import Product, ProductCategory
+
+    category = ProductCategory(
+        name=f"Test Category {uuid.uuid4().hex[:6]}",
+        slug=f"test-category-{uuid.uuid4().hex[:8]}",
+        description="Test category",
+    )
+    db_session.add(category)
+    db_session.flush()
+
+    product = Product(
+        name=f"Test Zirconia Crown {uuid.uuid4().hex[:6]}",
+        slug=f"test-zirconia-crown-{uuid.uuid4().hex[:8]}",
+        description="Product created for automated tests.",
+        category_id=category.id,
+        price=149.99,
+        is_active=True,
+    )
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+    return product
+
+
+@pytest.fixture
+def future_due_date():
+    return (datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
+def test_health_check(client):
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "healthy"}
+
+
+def test_api_root(client):
+    response = client.get("/")
+
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["status"] == "ok"
+    assert body["docs"] == "/docs"
+    assert "name" in body
+import uuid
+
+
+def test_register_dentist(client):
+    payload = {
+        "email": f"new-dentist-{uuid.uuid4().hex[:8]}@example.com",
+        "full_name": "New Dentist",
+        "password": "SecurePass123",
+        "practice_name": "New Dental Practice",
+        "phone": "+1-555-0100",
+        "role": "dentist",
+    }
+
+    response = client.post("/api/auth/register", json=payload)
+
+    assert response.status_code == 201
+    body = response.json()
+
+    assert body["email"] == payload["email"]
+    assert body["role"] == "dentist"
+    assert body["is_active"] is True
+    assert "hashed_password" not in body
+
+
+def test_register_duplicate_email(client, dentist_user):
+    payload = {
+        "email": dentist_user.email,
+        "full_name": "Duplicate User",
+        "password": "SecurePass123",
+    }
+
+    response = client.post("/api/auth/register", json=payload)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "A user with this email already exists"
+
+
+def test_register_rejects_short_password(client):
+    payload = {
+        "email": f"short-password-{uuid.uuid4().hex[:8]}@example.com",
+        "full_name": "Short Password User",
+        "password": "123",
+    }
+
+    response = client.post("/api/auth/register", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_login_success(client, dentist_user):
+    response = client.post(
+        "/api/auth/login",
+        data={
+            "username": dentist_user.email,
+            "password": "Dentist@12345",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["token_type"] == "bearer"
+    assert body["access_token"]
+    assert body["user"]["email"] == dentist_user.email
+    assert body["user"]["role"] == "dentist"
+
+
+def test_login_invalid_password(client, dentist_user):
+    response = client.post(
+        "/api/auth/login",
+        data={
+            "username": dentist_user.email,
+            "password": "wrong-password",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Incorrect email or password"
+
+
+def test_get_current_user(client, dentist_headers, dentist_user):
+    response = client.get("/api/auth/me", headers=dentist_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["id"] == dentist_user.id
+    assert body["email"] == dentist_user.email
+
+
+def test_get_current_user_without_token(client):
+    response = client.get("/api/auth/me")
+
+    assert response.status_code == 401
+
+
+def test_get_current_user_with_invalid_token(client):
+    response = client.get(
+        "/api/auth/me",
+        headers={"Authorization": "Bearer invalid-token"},
+    )
+
+    assert response.status_code == 401
+import uuid
+
+
+def test_list_products(client, seeded_product):
+    response = client.get("/api/catalog/products")
+
+    assert response.status_code == 200
+    products = response.json()
+
+    assert isinstance(products, list)
+    assert any(product["id"] == seeded_product.id for product in products)
+
+
+def test_get_product_by_id(client, seeded_product):
+    response = client.get(f"/api/catalog/products/{seeded_product.id}")
+
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["id"] == seeded_product.id
+    assert body["name"] == seeded_product.name
+    assert body["price"] == seeded_product.price
+
+
+def test_get_missing_product(client):
+    response = client.get("/api/catalog/products/999999")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Product not found"
+
+
+def test_create_category_as_admin(client, admin_headers):
+    payload = {
+        "name": f"Automation Category {uuid.uuid4().hex[:8]}",
+        "description": "Created by pytest",
+    }
+
+    response = client.post(
+        "/api/catalog/categories",
+        headers=admin_headers,
+        json=payload,
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+
+    assert body["name"] == payload["name"]
+    assert body["slug"].startswith("automation-category-")
+
+
+def test_create_category_as_dentist_forbidden(client, dentist_headers):
+    response = client.post(
+        "/api/catalog/categories",
+        headers=dentist_headers,
+        json={"name": "Unauthorized Category"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Administrator privileges required"
+
+
+def test_create_product_as_admin(client, admin_headers, db_session):
+    from app.models import ProductCategory
+
+    category = ProductCategory(
+        name=f"Product Category {uuid.uuid4().hex[:6]}",
+        slug=f"product-category-{uuid.uuid4().hex[:8]}",
+    )
+    db_session.add(category)
+    db_session.commit()
+    db_session.refresh(category)
+
+    payload = {
+        "name": f"Automation Product {uuid.uuid4().hex[:8]}",
+        "description": "Created by pytest",
+        "category_id": category.id,
+        "price": 199.99,
+        "is_active": True,
+    }
+
+    response = client.post(
+        "/api/catalog/products",
+        headers=admin_headers,
+        json=payload,
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+
+    assert body["name"] == payload["name"]
+    assert body["price"] == payload["price"]
+    assert body["is_active"] is True
+
+
+def test_update_product_as_admin(client, admin_headers, seeded_product):
+    response = client.patch(
+        f"/api/catalog/products/{seeded_product.id}",
+        headers=admin_headers,
+        json={"price": 249.99, "is_active": False},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["price"] == 249.99
+    assert body["is_active"] is False
+
+
+def test_delete_product_as_admin(client, admin_headers, seeded_product):
+    response = client.delete(
+        f"/api/catalog/products/{seeded_product.id}",
+        headers=admin_headers,
+    )
+
+    assert response.status_code == 204
+
+    follow_up = client.get(f"/api/catalog/products/{seeded_product.id}")
+    assert follow_up.status_code == 404
+import io
+import uuid
+
+
+def create_case(client, headers, product_id, due_date):
+    payload = {
+        "patient_reference": f"Patient-{uuid.uuid4().hex[:8]}",
+        "product_id": product_id,
+        "tooth_numbers": "14, 15",
+        "shade": "A2",
+        "clinical_notes": "Posterior crowns, normal occlusion.",
+        "due_date": due_date,
+    }
+    return client.post("/api/cases", headers=headers, json=payload)
+
+
+def test_create_dental_case(client, dentist_headers, seeded_product, future_due_date):
+    response = create_case(
+        client,
+        dentist_headers,
+        seeded_product.id,
+        future_due_date,
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+
+    assert body["status"] == "received"
+    assert body["case_number"].startswith("GW-")
+    assert body["patient_reference"].startswith("Patient-")
+    assert body["product_id"] == seeded_product.id
+    assert len(body["status_history"]) == 1
+    assert body["status_history"][0]["status"] == "received"
+
+
+def test_create_case_with_invalid_product(client, dentist_headers, future_due_date):
+    response = create_case(
+        client,
+        dentist_headers,
+        999999,
+        future_due_date,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid product"
+
+
+def test_dentist_can_only_view_own_cases(
+    client,
+    dentist_headers,
+    dentist_user,
+    admin_headers,
+    admin_user,
+    seeded_product,
+    future_due_date,
+):
+    created = create_case(
+        client,
+        dentist_headers,
+        seeded_product.id,
+        future_due_date,
+    )
+    assert created.status_code == 201
+    case_id = created.json()["id"]
+
+    own_response = client.get(f"/api/cases/{case_id}", headers=dentist_headers)
+    assert own_response.status_code == 200
+    assert own_response.json()["owner_id"] == dentist_user.id
+
+    other_response = client.get(f"/api/cases/{case_id}", headers=admin_headers)
+    assert other_response.status_code == 200
+
+
+def test_admin_can_update_case_status(
+    client,
+    dentist_headers,
+    admin_headers,
+    seeded_product,
+    future_due_date,
+):
+    created = create_case(
+        client,
+        dentist_headers,
+        seeded_product.id,
+        future_due_date,
+    )
+    case_id = created.json()["id"]
+
+    response = client.patch(
+        f"/api/cases/{case_id}",
+        headers=admin_headers,
+        json={"status": "in_design"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["status"] == "in_design"
+    statuses = [item["status"] for item in body["status_history"]]
+    assert "received" in statuses
+    assert "in_design" in statuses
+
+
+def test_dentist_cannot_change_case_status(
+    client,
+    dentist_headers,
+    seeded_product,
+    future_due_date,
+):
+    created = create_case(
+        client,
+        dentist_headers,
+        seeded_product.id,
+        future_due_date,
+    )
+    case_id = created.json()["id"]
+
+    response = client.patch(
+        f"/api/cases/{case_id}",
+        headers=dentist_headers,
+        json={"status": "in_production"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "received"
+
+
+def test_upload_case_file(
+    client,
+    dentist_headers,
+    seeded_product,
+    future_due_date,
+):
+    created = create_case(
+        client,
+        dentist_headers,
+        seeded_product.id,
+        future_due_date,
+    )
+    case_id = created.json()["id"]
+
+    file_content = b"fake-png-content"
+    response = client.post(
+        f"/api/cases/{case_id}/files",
+        headers=dentist_headers,
+        files={
+            "file": (
+                "scan.png",
+                io.BytesIO(file_content),
+                "image/png",
+            )
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+
+    assert len(body["files"]) == 1
+    uploaded_file = body["files"][0]
+
+    assert uploaded_file["original_filename"] == "scan.png"
+    assert uploaded_file["content_type"] == "image/png"
+    assert uploaded_file["size_bytes"] == len(file_content)
+    assert uploaded_file["file_url"].startswith("/uploads/")
+
+
+def test_upload_rejects_unsupported_file_type(
+    client,
+    dentist_headers,
+    seeded_product,
+    future_due_date,
+):
+    created = create_case(
+        client,
+        dentist_headers,
+        seeded_product.id,
+        future_due_date,
+    )
+    case_id = created.json()["id"]
+
+    response = client.post(
+        f"/api/cases/{case_id}/files",
+        headers=dentist_headers,
+        files={
+            "file": (
+                "malicious.exe",
+                io.BytesIO(b"binary"),
+                "application/x-msdownload",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Unsupported file type" in response.json()["detail"]
+
+
+def test_cancel_case(
+    client,
+    dentist_headers,
+    seeded_product,
+    future_due_date,
+):
+    created = create_case(
+        client,
+        dentist_headers,
+        seeded_product.id,
+        future_due_date,
+    )
+    case_id = created.json()["id"]
+
+    response = client.delete(
+        f"/api/cases/{case_id}",
+        headers=dentist_headers,
+    )
+
+    assert response.status_code == 204
+
+    detail = client.get(f"/api/cases/{case_id}", headers=dentist_headers)
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "cancelled"
+
+
+def test_get_missing_case(client, dentist_headers):
+    response = client.get(
+        "/api/cases/00000000-0000-0000-0000-000000000000",
+        headers=dentist_headers,
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Case not found"
+import uuid
+from datetime import datetime, timedelta, timezone
+
+
+def test_list_events(client):
+    response = client.get("/api/events")
+
+    assert response.status_code == 200
+    assert isinstance(response.json(), list)
+
+
+def test_create_event_as_admin(client, admin_headers):
+    starts_at = datetime.now(timezone.utc) + timedelta(days=7)
+    ends_at = starts_at + timedelta(hours=2)
+
+    payload = {
+        "title": f"Pytest CE Webinar {uuid.uuid4().hex[:8]}",
+        "event_type": "webinar",
+        "description": "Automated event created by pytest.",
+        "location": "Online",
+        "starts_at": starts_at.isoformat(),
+        "ends_at": ends_at.isoformat(),
+        "registration_url": "https://example.com/register",
+        "is_published": True,
+    }
+
+    response = client.post(
+        "/api/events",
+        headers=admin_headers,
+        json=payload,
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+
+    assert body["title"] == payload["title"]
+    assert body["event_type"] == "webinar"
+    assert body["is_published"] is True
+
+
+def test_create_event_as_dentist_forbidden(client, dentist_headers):
+    response = client.post(
+        "/api/events",
+        headers=dentist_headers,
+        json={
+            "title": "Unauthorized Event",
+            "starts_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    assert response.status_code == 403
+
+
+def test_list_articles(client):
+    response = client.get("/api/articles")
+
+    assert response.status_code == 200
+    articles = response.json()
+
+    assert isinstance(articles, list)
+    for article in articles:
+        assert article["is_published"] is True
+
+
+def test_get_article_by_slug(client):
+    response = client.get("/api/articles/understanding-dental-case-statuses")
+
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["slug"] == "understanding-dental-case-statuses"
+    assert body["is_published"] is True
+
+
+def test_get_missing_article(client):
+    response = client.get("/api/articles/does-not-exist")
+
+    assert response.status_code == 404
+import uuid
+
+
+def test_submit_contact_message(client):
+    payload = {
+        "full_name": "Pytest Contact User",
+        "email": f"contact-{uuid.uuid4().hex[:8]}@example.com",
+        "phone": "+1-555-0199",
+        "subject": "Automated contact test",
+        "message": "This message was submitted by an automated pytest test.",
+    }
+
+    response = client.post("/api/contact", json=payload)
+
+    assert response.status_code == 201
+    body = response.json()
+
+    assert body["email"] == payload["email"]
+    assert body["is_handled"] is False
+
+
+def test_submit_contact_message_validation_error(client):
+    payload = {
+        "full_name": "X",
+        "email": "not-an-email",
+        "subject": "Bad",
+        "message": "short",
+    }
+
+    response = client.post("/api/contact", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_admin_can_list_contact_messages(client, admin_headers):
+    payload = {
+        "full_name": "Admin Contact Test",
+        "email": f"admin-contact-{uuid.uuid4().hex[:8]}@example.com",
+        "subject": "Admin inbox test",
+        "message": "This contact message should appear in the admin inbox.",
+    }
+
+    created = client.post("/api/contact", json=payload)
+    assert created.status_code == 201
+
+    response = client.get(
+        "/api/contact",
+        headers=admin_headers,
+        params={"handled": False},
+    )
+
+    assert response.status_code == 200
+    messages = response.json()
+
+    assert any(message["email"] == payload["email"] for message in messages)
+
+
+def test_dentist_cannot_list_contact_messages(client, dentist_headers):
+    response = client.get("/api/contact", headers=dentist_headers)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Administrator privileges required"
